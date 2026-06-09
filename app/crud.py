@@ -160,31 +160,41 @@ def update_inventory_available(db: Session, inventory_id: int, delta: int):
 
 
 def reserve_inventory(db: Session, product_id: int, location_id: int, qty: int):
-    inv = db.query(models.InventoryItem).filter(
-        models.InventoryItem.product_id == product_id,
-        models.InventoryItem.location_id == location_id
-    ).first()
+    inv = (
+        db.query(models.InventoryItem)
+        .filter(
+            models.InventoryItem.product_id == product_id,
+            models.InventoryItem.location_id == location_id,
+        )
+        .with_for_update()
+        .first()
+    )
     if not inv:
         return False
     if inv.available_qty < qty:
         return False
     inv.available_qty -= qty
     inv.reserved_qty += qty
-    db.commit()
+    db.flush()
     return True
 
 
 def release_reserved_inventory(db: Session, product_id: int, location_id: int, qty: int):
-    inv = db.query(models.InventoryItem).filter(
-        models.InventoryItem.product_id == product_id,
-        models.InventoryItem.location_id == location_id
-    ).first()
+    inv = (
+        db.query(models.InventoryItem)
+        .filter(
+            models.InventoryItem.product_id == product_id,
+            models.InventoryItem.location_id == location_id,
+        )
+        .with_for_update()
+        .first()
+    )
     if not inv:
         return False
     release_qty = min(qty, inv.reserved_qty)
     inv.available_qty += release_qty
     inv.reserved_qty -= release_qty
-    db.commit()
+    db.flush()
     return True
 
 
@@ -382,9 +392,21 @@ def start_task(db: Session, task_id: int, picker: Optional[str] = None):
 
 
 def complete_task(db: Session, task_id: int, data: schemas.PickTaskComplete):
-    task = get_pick_task(db, task_id)
+    task = (
+        db.query(models.PickTask)
+        .filter(models.PickTask.id == task_id)
+        .with_for_update()
+        .first()
+    )
     if not task:
         return None
+
+    if task.status in [models.TaskStatus.COMPLETED, models.TaskStatus.CANCELLED]:
+        db.commit()
+        return task
+    if task.status == models.TaskStatus.EXCEPTION:
+        db.commit()
+        return task
 
     picked = data.picked_qty
     short = data.short_qty or 0
@@ -413,6 +435,7 @@ def complete_task(db: Session, task_id: int, data: schemas.PickTaskComplete):
 
     release_reserved_inventory(db, task.product_id, task.location_id, task.planned_qty)
 
+    db.flush()
     db.commit()
     db.refresh(task)
     update_picklist_status(db, task.picklist_id)
@@ -420,9 +443,17 @@ def complete_task(db: Session, task_id: int, data: schemas.PickTaskComplete):
 
 
 def report_task_exception(db: Session, task_id: int, data: schemas.PickTaskException):
-    task = get_pick_task(db, task_id)
+    task = (
+        db.query(models.PickTask)
+        .filter(models.PickTask.id == task_id)
+        .with_for_update()
+        .first()
+    )
     if not task:
         return None
+    if task.status in [models.TaskStatus.COMPLETED, models.TaskStatus.CANCELLED]:
+        db.commit()
+        return task
 
     task.status = models.TaskStatus.EXCEPTION
     task.exception_code = data.exception_code
@@ -434,6 +465,7 @@ def report_task_exception(db: Session, task_id: int, data: schemas.PickTaskExcep
 
     release_reserved_inventory(db, task.product_id, task.location_id, task.planned_qty)
 
+    db.flush()
     db.commit()
     db.refresh(task)
     update_picklist_status(db, task.picklist_id)
