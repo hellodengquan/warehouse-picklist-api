@@ -1,10 +1,16 @@
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_, text
 from datetime import datetime
 from typing import Optional, List, Tuple
 import uuid
 
 from app import models, schemas
+
+
+def _begin_immediate(db: Session):
+    conn = db.connection()
+    if not conn.in_transaction():
+        conn.execute(text("BEGIN IMMEDIATE"))
 
 
 def generate_no(prefix: str) -> str:
@@ -160,15 +166,10 @@ def update_inventory_available(db: Session, inventory_id: int, delta: int):
 
 
 def reserve_inventory(db: Session, product_id: int, location_id: int, qty: int):
-    inv = (
-        db.query(models.InventoryItem)
-        .filter(
-            models.InventoryItem.product_id == product_id,
-            models.InventoryItem.location_id == location_id,
-        )
-        .with_for_update()
-        .first()
-    )
+    inv = db.query(models.InventoryItem).filter(
+        models.InventoryItem.product_id == product_id,
+        models.InventoryItem.location_id == location_id
+    ).first()
     if not inv:
         return False
     if inv.available_qty < qty:
@@ -180,15 +181,10 @@ def reserve_inventory(db: Session, product_id: int, location_id: int, qty: int):
 
 
 def release_reserved_inventory(db: Session, product_id: int, location_id: int, qty: int):
-    inv = (
-        db.query(models.InventoryItem)
-        .filter(
-            models.InventoryItem.product_id == product_id,
-            models.InventoryItem.location_id == location_id,
-        )
-        .with_for_update()
-        .first()
-    )
+    inv = db.query(models.InventoryItem).filter(
+        models.InventoryItem.product_id == product_id,
+        models.InventoryItem.location_id == location_id
+    ).first()
     if not inv:
         return False
     release_qty = min(qty, inv.reserved_qty)
@@ -199,6 +195,7 @@ def release_reserved_inventory(db: Session, product_id: int, location_id: int, q
 
 
 def create_picklist(db: Session, obj_in: schemas.PicklistCreate) -> models.Picklist:
+    _begin_immediate(db)
     picklist_no = obj_in.picklist_no or generate_no("PL")
     picklist_data = obj_in.model_dump(exclude={"items"}, exclude_unset=True)
     picklist_data["picklist_no"] = picklist_no
@@ -289,7 +286,7 @@ def list_picklists(
     return items, total
 
 
-def update_picklist_status(db: Session, picklist_id: int):
+def update_picklist_status(db: Session, picklist_id: int, do_commit: bool = True):
     picklist = get_picklist(db, picklist_id)
     if not picklist:
         return
@@ -323,11 +320,13 @@ def update_picklist_status(db: Session, picklist_id: int):
     elif all_pending:
         picklist.status = models.PicklistStatus.PENDING
 
-    db.commit()
+    db.flush()
+    if do_commit:
+        db.commit()
     db.refresh(picklist)
 
     if picklist.batch_id:
-        update_batch_status(db, picklist.batch_id)
+        update_batch_status(db, picklist.batch_id, do_commit=do_commit)
 
 
 def get_pick_task(db: Session, task_id: int):
@@ -369,9 +368,10 @@ def assign_task(db: Session, task_id: int, picker: str):
     task.picker = picker
     task.status = models.TaskStatus.ASSIGNED
     task.assigned_at = datetime.now()
+    db.flush()
+    update_picklist_status(db, task.picklist_id, do_commit=False)
     db.commit()
     db.refresh(task)
-    update_picklist_status(db, task.picklist_id)
     return task
 
 
@@ -385,27 +385,25 @@ def start_task(db: Session, task_id: int, picker: Optional[str] = None):
     task.started_at = datetime.now()
     if not task.assigned_at:
         task.assigned_at = datetime.now()
+    db.flush()
+    update_picklist_status(db, task.picklist_id, do_commit=False)
     db.commit()
     db.refresh(task)
-    update_picklist_status(db, task.picklist_id)
     return task
 
 
 def complete_task(db: Session, task_id: int, data: schemas.PickTaskComplete):
-    task = (
-        db.query(models.PickTask)
-        .filter(models.PickTask.id == task_id)
-        .with_for_update()
-        .first()
-    )
+    _begin_immediate(db)
+    task = db.query(models.PickTask).filter(models.PickTask.id == task_id).first()
     if not task:
+        db.rollback()
         return None
 
     if task.status in [models.TaskStatus.COMPLETED, models.TaskStatus.CANCELLED]:
-        db.commit()
+        db.rollback()
         return task
     if task.status == models.TaskStatus.EXCEPTION:
-        db.commit()
+        db.rollback()
         return task
 
     picked = data.picked_qty
@@ -436,23 +434,20 @@ def complete_task(db: Session, task_id: int, data: schemas.PickTaskComplete):
     release_reserved_inventory(db, task.product_id, task.location_id, task.planned_qty)
 
     db.flush()
+    update_picklist_status(db, task.picklist_id, do_commit=False)
     db.commit()
     db.refresh(task)
-    update_picklist_status(db, task.picklist_id)
     return task
 
 
 def report_task_exception(db: Session, task_id: int, data: schemas.PickTaskException):
-    task = (
-        db.query(models.PickTask)
-        .filter(models.PickTask.id == task_id)
-        .with_for_update()
-        .first()
-    )
+    _begin_immediate(db)
+    task = db.query(models.PickTask).filter(models.PickTask.id == task_id).first()
     if not task:
+        db.rollback()
         return None
     if task.status in [models.TaskStatus.COMPLETED, models.TaskStatus.CANCELLED]:
-        db.commit()
+        db.rollback()
         return task
 
     task.status = models.TaskStatus.EXCEPTION
@@ -466,9 +461,9 @@ def report_task_exception(db: Session, task_id: int, data: schemas.PickTaskExcep
     release_reserved_inventory(db, task.product_id, task.location_id, task.planned_qty)
 
     db.flush()
+    update_picklist_status(db, task.picklist_id, do_commit=False)
     db.commit()
     db.refresh(task)
-    update_picklist_status(db, task.picklist_id)
     return task
 
 
@@ -623,7 +618,7 @@ def start_batch(db: Session, batch_id: int, picker: Optional[str] = None):
     return batch
 
 
-def update_batch_status(db: Session, batch_id: int):
+def update_batch_status(db: Session, batch_id: int, do_commit: bool = True):
     batch = get_pick_batch(db, batch_id)
     if not batch:
         return
@@ -658,5 +653,7 @@ def update_batch_status(db: Session, batch_id: int):
         if not batch.actual_start_at:
             batch.actual_start_at = datetime.now()
 
-    db.commit()
+    db.flush()
+    if do_commit:
+        db.commit()
     db.refresh(batch)

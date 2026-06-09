@@ -1,3 +1,11 @@
+# 使用文件SQLite而非内存模式的原因：
+# 1. 内存数据库(:memory:)在每个连接时创建独立实例，跨连接数据不可见，
+#    无法模拟真实多线程/并发访问场景
+# 2. 文件数据库支持WAL模式(Write-Ahead Logging)，
+#    提供更好的并发读写性能和事务隔离保证
+# 3. 便于测试失败时保留数据库文件以检查数据状态，定位问题
+# 4. 支持BEGIN IMMEDIATE等显式锁机制需要真实文件锁，
+#    内存模式无法完全模拟生产行为
 import pytest
 import tempfile
 import os
@@ -18,7 +26,7 @@ def db_engine():
     db_url = f"sqlite:///{tmp.name}"
     engine = create_engine(
         db_url,
-        connect_args={"check_same_thread": False},
+        connect_args={"check_same_thread": False, "isolation_level": None},
     )
 
     @event.listens_for(engine, "connect")
