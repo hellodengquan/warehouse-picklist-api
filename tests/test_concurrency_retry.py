@@ -98,8 +98,31 @@ class TestBeginImmediateRetry:
         assert mock_sleep.call_args_list[0][0][0] == 0.05
         assert mock_sleep.call_args_list[1][0][0] == 0.1
         assert "重试3次" in exc_info.value.message
-        assert exc_info.value.retry_after_ms > 0
+        assert exc_info.value.retry_after_ms == 350
+        assert exc_info.value.__cause__ is not None
         assert "_manual_tx_active" not in db_session.info
+
+    @patch("app.crud.time.sleep", return_value=None)
+    def test_retry_after_ms_matches_actual_sleep_plus_next_delay(self, mock_sleep, db_session):
+        db_session.info.pop("_manual_tx_active", None)
+        real_conn = db_session.connection()
+        orig_execute = real_conn.execute
+
+        def always_locked(*args, **kwargs):
+            stmt = args[0]
+            stmt_str = str(stmt).upper() if hasattr(stmt, "__str__") else ""
+            if "BEGIN IMMEDIATE" in stmt_str:
+                raise _make_operational_error_locked()
+            return orig_execute(*args, **kwargs)
+
+        with patch.object(real_conn, "execute", side_effect=always_locked):
+            with pytest.raises(DatabaseBusyError) as exc_info:
+                crud._begin_immediate(db_session)
+
+        total_slept = sum(call[0][0] * 1000 for call in mock_sleep.call_args_list)
+        next_delay = 200
+        assert total_slept == 150
+        assert exc_info.value.retry_after_ms == total_slept + next_delay
 
     @patch("app.crud.time.sleep", return_value=None)
     def test_first_attempt_locked_second_ok(self, mock_sleep, db_session):
@@ -447,3 +470,89 @@ class TestFinallyRollback:
                 db.close()
             except Exception:
                 pass
+
+
+class TestEndManualTxErrorHandling:
+    def test_commit_failed_then_rollback_succeeds_raises_original(self, db_session):
+        db_session.info["_manual_tx_active"] = True
+        original_error = RuntimeError("模拟 commit 失败：磁盘 IO 错误")
+
+        real_rollback = db_session.rollback
+        call_log = []
+
+        def failing_commit():
+            call_log.append("commit")
+            raise original_error
+
+        def working_rollback():
+            call_log.append("rollback")
+            real_rollback()
+
+        with patch.object(db_session, "commit", side_effect=failing_commit):
+            with patch.object(db_session, "rollback", side_effect=working_rollback):
+                with pytest.raises(RuntimeError) as exc_info:
+                    crud._end_manual_tx(db_session, commit=True)
+
+        assert exc_info.value is original_error
+        assert exc_info.value.__cause__ is None
+        assert call_log == ["commit", "rollback"]
+        assert "_manual_tx_active" not in db_session.info
+
+    def test_commit_and_rollback_both_fail_with_chained_exception(self, db_session):
+        db_session.info["_manual_tx_active"] = True
+        primary_error = RuntimeError("模拟 commit 失败：磁盘满")
+        rollback_error = RuntimeError("模拟回滚失败：数据库文件损坏")
+
+        def failing_commit():
+            raise primary_error
+
+        def failing_rollback():
+            raise rollback_error
+
+        with patch.object(db_session, "commit", side_effect=failing_commit):
+            with patch.object(db_session, "rollback", side_effect=failing_rollback):
+                with patch("app.crud.logger") as mock_logger:
+                    with pytest.raises(RuntimeError) as exc_info:
+                        crud._end_manual_tx(db_session, commit=True)
+
+        assert exc_info.value is rollback_error
+        assert exc_info.value.__cause__ is primary_error
+        assert mock_logger.error.call_count >= 2
+        log_msgs = [call[0][0] for call in mock_logger.error.call_args_list]
+        assert any("事务commit失败" in msg for msg in log_msgs)
+        assert any("强制回滚也失败" in msg for msg in log_msgs)
+        assert "_manual_tx_active" not in db_session.info
+
+    def test_rollback_failed_then_force_rollback_succeeds(self, db_session):
+        db_session.info["_manual_tx_active"] = True
+        first_rollback_error = RuntimeError("第一次回滚失败")
+
+        real_rollback = db_session.rollback
+        call_count = {"n": 0}
+
+        def failing_first_rollback():
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise first_rollback_error
+            real_rollback()
+
+        with patch.object(db_session, "rollback", side_effect=failing_first_rollback):
+            with patch("app.crud.logger") as mock_logger:
+                with pytest.raises(RuntimeError) as exc_info:
+                    crud._end_manual_tx(db_session, commit=False)
+
+        assert exc_info.value is first_rollback_error
+        assert exc_info.value.__cause__ is None
+        assert call_count["n"] == 2
+        assert mock_logger.error.call_count >= 1
+        assert "事务rollback失败" in mock_logger.error.call_args_list[0][0][0]
+        assert "_manual_tx_active" not in db_session.info
+
+    def test_no_active_tx_does_nothing(self, db_session):
+        db_session.info.pop("_manual_tx_active", None)
+        with patch.object(db_session, "commit") as mock_commit:
+            with patch.object(db_session, "rollback") as mock_rollback:
+                crud._end_manual_tx(db_session, commit=True)
+                crud._end_manual_tx(db_session, commit=False)
+        assert mock_commit.call_count == 0
+        assert mock_rollback.call_count == 0

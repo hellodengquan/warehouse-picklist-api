@@ -5,9 +5,12 @@ from datetime import datetime
 from typing import Optional, List, Tuple
 import uuid
 import time
+import logging
 
 from app import models, schemas
 from app.exceptions import DatabaseBusyError
+
+logger = logging.getLogger(__name__)
 
 
 def _begin_immediate(db: Session):
@@ -16,7 +19,8 @@ def _begin_immediate(db: Session):
         return
     max_retries = 3
     delay_ms = 50
-    total_wait_ms = 0
+    total_slept_ms = 0
+    next_delay_ms = delay_ms
     for attempt in range(max_retries):
         try:
             conn = db.connection()
@@ -29,13 +33,13 @@ def _begin_immediate(db: Session):
                 raise
             if attempt < max_retries - 1:
                 time.sleep(delay_ms / 1000.0)
-                total_wait_ms += delay_ms
+                total_slept_ms += delay_ms
+                next_delay_ms = delay_ms * 2
                 delay_ms *= 2
             else:
-                total_wait_ms += delay_ms
                 raise DatabaseBusyError(
                     message=f"数据库繁忙，重试{max_retries}次后仍无法获取锁，请稍后重试",
-                    retry_after_ms=total_wait_ms + delay_ms,
+                    retry_after_ms=total_slept_ms + next_delay_ms,
                 ) from e
 
 
@@ -43,16 +47,22 @@ def _end_manual_tx(db: Session, *, commit: bool = False):
     info = db.info
     if not info.pop("_manual_tx_active", False):
         return
+    action = "commit" if commit else "rollback"
     try:
         if commit:
             db.commit()
         else:
             db.rollback()
-    except Exception:
+    except Exception as primary_exc:
+        logger.error(f"事务{action}失败，尝试强制回滚: {primary_exc}")
         try:
             db.rollback()
-        except Exception:
-            pass
+        except Exception as rollback_exc:
+            logger.error(
+                f"强制回滚也失败！事务可能处于不一致状态: {rollback_exc}",
+                exc_info=True,
+            )
+            raise rollback_exc from primary_exc
         raise
 
 
