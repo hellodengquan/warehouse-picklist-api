@@ -1,16 +1,59 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_, text
+from sqlalchemy.exc import OperationalError
 from datetime import datetime
 from typing import Optional, List, Tuple
 import uuid
+import time
 
 from app import models, schemas
+from app.exceptions import DatabaseBusyError
 
 
 def _begin_immediate(db: Session):
-    conn = db.connection()
-    if not conn.in_transaction():
-        conn.execute(text("BEGIN IMMEDIATE"))
+    info = db.info
+    if info.get("_manual_tx_active"):
+        return
+    max_retries = 3
+    delay_ms = 50
+    total_wait_ms = 0
+    for attempt in range(max_retries):
+        try:
+            conn = db.connection()
+            conn.execute(text("BEGIN IMMEDIATE"))
+            info["_manual_tx_active"] = True
+            return
+        except OperationalError as e:
+            err_str = str(e).lower()
+            if "database is locked" not in err_str and "locked" not in err_str:
+                raise
+            if attempt < max_retries - 1:
+                time.sleep(delay_ms / 1000.0)
+                total_wait_ms += delay_ms
+                delay_ms *= 2
+            else:
+                total_wait_ms += delay_ms
+                raise DatabaseBusyError(
+                    message=f"数据库繁忙，重试{max_retries}次后仍无法获取锁，请稍后重试",
+                    retry_after_ms=total_wait_ms + delay_ms,
+                ) from e
+
+
+def _end_manual_tx(db: Session, *, commit: bool = False):
+    info = db.info
+    if not info.pop("_manual_tx_active", False):
+        return
+    try:
+        if commit:
+            db.commit()
+        else:
+            db.rollback()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
 
 
 def generate_no(prefix: str) -> str:
@@ -196,61 +239,67 @@ def release_reserved_inventory(db: Session, product_id: int, location_id: int, q
 
 def create_picklist(db: Session, obj_in: schemas.PicklistCreate) -> models.Picklist:
     _begin_immediate(db)
-    picklist_no = obj_in.picklist_no or generate_no("PL")
-    picklist_data = obj_in.model_dump(exclude={"items"}, exclude_unset=True)
-    picklist_data["picklist_no"] = picklist_no
+    try:
+        picklist_no = obj_in.picklist_no or generate_no("PL")
+        picklist_data = obj_in.model_dump(exclude={"items"}, exclude_unset=True)
+        picklist_data["picklist_no"] = picklist_no
 
-    picklist = models.Picklist(**picklist_data)
-    db.add(picklist)
-    db.flush()
+        picklist = models.Picklist(**picklist_data)
+        db.add(picklist)
+        db.flush()
 
-    total_lines = 0
-    total_qty = 0
+        total_lines = 0
+        total_qty = 0
 
-    for idx, item in enumerate(obj_in.items):
-        product = get_product(db, item.product_id)
-        if not product:
-            raise ValueError(f"Product {item.product_id} not found")
+        for idx, item in enumerate(obj_in.items):
+            product = get_product(db, item.product_id)
+            if not product:
+                raise ValueError(f"Product {item.product_id} not found")
 
-        location_id = item.location_id
-        inventory = None
-        if location_id:
-            inventory = db.query(models.InventoryItem).filter(
-                models.InventoryItem.product_id == item.product_id,
-                models.InventoryItem.location_id == location_id
-            ).first()
-        if not inventory:
-            inventory = find_best_inventory_location(db, item.product_id, item.planned_qty, location_id)
+            location_id = item.location_id
+            inventory = None
+            if location_id:
+                inventory = db.query(models.InventoryItem).filter(
+                    models.InventoryItem.product_id == item.product_id,
+                    models.InventoryItem.location_id == location_id
+                ).first()
+            if not inventory:
+                inventory = find_best_inventory_location(db, item.product_id, item.planned_qty, location_id)
 
-        if not inventory:
-            raise ValueError(f"No available inventory for product {product.sku}")
+            if not inventory:
+                raise ValueError(f"No available inventory for product {product.sku}")
 
-        location = get_location(db, inventory.location_id)
+            location = get_location(db, inventory.location_id)
 
-        task_no = generate_no("TK")
-        task = models.PickTask(
-            task_no=task_no,
-            picklist_id=picklist.id,
-            location_id=location.id,
-            product_id=product.id,
-            product_sku=product.sku,
-            product_name=product.name,
-            location_code=location.code,
-            lot_number=inventory.lot_number,
-            planned_qty=item.planned_qty,
-            sort_order=item.sort_order or idx,
-        )
-        db.add(task)
-        reserve_inventory(db, product.id, location.id, item.planned_qty)
+            task_no = generate_no("TK")
+            task = models.PickTask(
+                task_no=task_no,
+                picklist_id=picklist.id,
+                location_id=location.id,
+                product_id=product.id,
+                product_sku=product.sku,
+                product_name=product.name,
+                location_code=location.code,
+                lot_number=inventory.lot_number,
+                planned_qty=item.planned_qty,
+                sort_order=item.sort_order or idx,
+            )
+            db.add(task)
+            reserve_inventory(db, product.id, location.id, item.planned_qty)
 
-        total_lines += 1
-        total_qty += item.planned_qty
+            total_lines += 1
+            total_qty += item.planned_qty
 
-    picklist.total_lines = total_lines
-    picklist.total_qty = total_qty
-    db.commit()
-    db.refresh(picklist)
-    return picklist
+        picklist.total_lines = total_lines
+        picklist.total_qty = total_qty
+        _end_manual_tx(db, commit=True)
+        db.refresh(picklist)
+        return picklist
+    except Exception:
+        _end_manual_tx(db, commit=False)
+        raise
+    finally:
+        _end_manual_tx(db, commit=False)
 
 
 def get_picklist(db: Session, picklist_id: int):
@@ -394,77 +443,89 @@ def start_task(db: Session, task_id: int, picker: Optional[str] = None):
 
 def complete_task(db: Session, task_id: int, data: schemas.PickTaskComplete):
     _begin_immediate(db)
-    task = db.query(models.PickTask).filter(models.PickTask.id == task_id).first()
-    if not task:
-        db.rollback()
-        return None
+    try:
+        task = db.query(models.PickTask).filter(models.PickTask.id == task_id).first()
+        if not task:
+            _end_manual_tx(db, commit=False)
+            return None
 
-    if task.status in [models.TaskStatus.COMPLETED, models.TaskStatus.CANCELLED]:
-        db.rollback()
+        if task.status in [models.TaskStatus.COMPLETED, models.TaskStatus.CANCELLED]:
+            _end_manual_tx(db, commit=False)
+            return task
+        if task.status == models.TaskStatus.EXCEPTION:
+            _end_manual_tx(db, commit=False)
+            return task
+
+        picked = data.picked_qty
+        short = data.short_qty or 0
+        damage = data.damage_qty or 0
+        total = picked + short + damage
+
+        if total != task.planned_qty and short == 0:
+            short = task.planned_qty - picked - damage
+            if short < 0:
+                short = 0
+
+        task.picked_qty = picked
+        task.short_qty = short
+        task.damage_qty = damage
+        task.scan_code = data.scan_code
+        task.completed_at = datetime.now()
+
+        if short > 0 or damage > 0:
+            task.status = models.TaskStatus.EXCEPTION
+            task.exception_code = data.exception_code or ("SHORT" if short > 0 else "DAMAGE")
+            task.exception_note = data.exception_note
+        else:
+            task.status = models.TaskStatus.COMPLETED
+            task.exception_code = None
+            task.exception_note = None
+
+        release_reserved_inventory(db, task.product_id, task.location_id, task.planned_qty)
+
+        db.flush()
+        update_picklist_status(db, task.picklist_id, do_commit=False)
+        _end_manual_tx(db, commit=True)
+        db.refresh(task)
         return task
-    if task.status == models.TaskStatus.EXCEPTION:
-        db.rollback()
-        return task
-
-    picked = data.picked_qty
-    short = data.short_qty or 0
-    damage = data.damage_qty or 0
-    total = picked + short + damage
-
-    if total != task.planned_qty and short == 0:
-        short = task.planned_qty - picked - damage
-        if short < 0:
-            short = 0
-
-    task.picked_qty = picked
-    task.short_qty = short
-    task.damage_qty = damage
-    task.scan_code = data.scan_code
-    task.completed_at = datetime.now()
-
-    if short > 0 or damage > 0:
-        task.status = models.TaskStatus.EXCEPTION
-        task.exception_code = data.exception_code or ("SHORT" if short > 0 else "DAMAGE")
-        task.exception_note = data.exception_note
-    else:
-        task.status = models.TaskStatus.COMPLETED
-        task.exception_code = None
-        task.exception_note = None
-
-    release_reserved_inventory(db, task.product_id, task.location_id, task.planned_qty)
-
-    db.flush()
-    update_picklist_status(db, task.picklist_id, do_commit=False)
-    db.commit()
-    db.refresh(task)
-    return task
+    except Exception:
+        _end_manual_tx(db, commit=False)
+        raise
+    finally:
+        _end_manual_tx(db, commit=False)
 
 
 def report_task_exception(db: Session, task_id: int, data: schemas.PickTaskException):
     _begin_immediate(db)
-    task = db.query(models.PickTask).filter(models.PickTask.id == task_id).first()
-    if not task:
-        db.rollback()
-        return None
-    if task.status in [models.TaskStatus.COMPLETED, models.TaskStatus.CANCELLED]:
-        db.rollback()
+    try:
+        task = db.query(models.PickTask).filter(models.PickTask.id == task_id).first()
+        if not task:
+            _end_manual_tx(db, commit=False)
+            return None
+        if task.status in [models.TaskStatus.COMPLETED, models.TaskStatus.CANCELLED]:
+            _end_manual_tx(db, commit=False)
+            return task
+
+        task.status = models.TaskStatus.EXCEPTION
+        task.exception_code = data.exception_code
+        task.exception_note = data.exception_note
+        task.picked_qty = data.picked_qty or 0
+        task.short_qty = data.short_qty or 0
+        task.damage_qty = data.damage_qty or 0
+        task.completed_at = datetime.now()
+
+        release_reserved_inventory(db, task.product_id, task.location_id, task.planned_qty)
+
+        db.flush()
+        update_picklist_status(db, task.picklist_id, do_commit=False)
+        _end_manual_tx(db, commit=True)
+        db.refresh(task)
         return task
-
-    task.status = models.TaskStatus.EXCEPTION
-    task.exception_code = data.exception_code
-    task.exception_note = data.exception_note
-    task.picked_qty = data.picked_qty or 0
-    task.short_qty = data.short_qty or 0
-    task.damage_qty = data.damage_qty or 0
-    task.completed_at = datetime.now()
-
-    release_reserved_inventory(db, task.product_id, task.location_id, task.planned_qty)
-
-    db.flush()
-    update_picklist_status(db, task.picklist_id, do_commit=False)
-    db.commit()
-    db.refresh(task)
-    return task
+    except Exception:
+        _end_manual_tx(db, commit=False)
+        raise
+    finally:
+        _end_manual_tx(db, commit=False)
 
 
 def create_pick_batch(db: Session, obj_in: schemas.PickBatchCreate) -> models.PickBatch:

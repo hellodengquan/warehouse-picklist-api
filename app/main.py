@@ -8,6 +8,7 @@ import sys
 from app.database import engine, Base
 from app import models
 from app.routers import products, locations, picklists, batches, tasks
+from app.exceptions import DatabaseBusyError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +49,23 @@ async def integrity_error_handler(request: Request, exc: IntegrityError):
             "message": "数据操作失败，可能存在唯一约束冲突或引用错误",
             "data": {"detail": str(exc.orig)},
         },
+    )
+
+
+@app.exception_handler(DatabaseBusyError)
+async def database_busy_handler(request: Request, exc: DatabaseBusyError):
+    logger.warning(f"数据库繁忙: {request.url} - {exc.message}")
+    return JSONResponse(
+        status_code=503,
+        content={
+            "code": 503,
+            "message": exc.message,
+            "data": {
+                "retry_after_ms": exc.retry_after_ms,
+                "suggestion": "请稍后重试，或减少并发请求量",
+            },
+        },
+        headers={"Retry-After": str(max(1, (exc.retry_after_ms + 999) // 1000))},
     )
 
 
